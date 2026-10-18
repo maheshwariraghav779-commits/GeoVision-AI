@@ -240,6 +240,9 @@ class TemporalAnalysisResponse(BaseModel):
 class GeoJSONGeometry(BaseModel):
     type: str
     coordinates: List[Any]
+    radius_meters: Optional[float] = None
+    radius_km: Optional[float] = None
+    center: Optional[List[float]] = None
 
 
 class AOIAnalysisRequest(BaseModel):

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Map, NavigationControl, FullscreenControl, Marker } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { apiPost } from '../api/client';
+import { apiPost, getHealthStatus } from '../api/client';
 import {
   DEFAULT_BASEMAP_ID,
   getBasemapStyle,
@@ -147,6 +147,9 @@ const GEE_LAYERS = [
   { key: 'water_change', label: 'Water Delta', icon: '🌊', desc: 'NDWI Shift / Inundation' },
 ];
 
+import { createCircularPolygon } from '../utils/geometry';
+export { createCircularPolygon };
+
 export default function AOIAnalysis() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -164,6 +167,13 @@ export default function AOIAnalysis() {
   });
   const [aoiAreaApprox, setAoiAreaApprox] = useState(65.66);
   const [clickRadiusKm, setClickRadiusKm] = useState(5);
+  const [radiusCenter, setRadiusCenter] = useState(null); // { lat, lng }
+  const radiusCenterRef = useRef(null);
+  useEffect(() => {
+    radiusCenterRef.current = radiusCenter;
+  }, [radiusCenter]);
+  const radiusMarkerRef = useRef(null);
+  const handleMapClickPointRef = useRef(null);
 
   // Drawing mode: 'polygon' | 'rectangle' | 'radius' | 'preset' | 'coords'
   const [drawMode, setDrawMode] = useState('polygon');
@@ -189,6 +199,28 @@ export default function AOIAnalysis() {
   const [analysisResult, setAnalysisResult] = useState(null);
   const [error, setError] = useState(null);
   const [mapError, setMapError] = useState(null);
+
+  // Backend GEE Connectivity State: 'unverified' | 'connected' | 'unavailable'
+  const [geeStatus, setGeeStatus] = useState('unverified');
+
+  useEffect(() => {
+    let isMounted = true;
+    getHealthStatus()
+      .then((res) => {
+        if (!isMounted) return;
+        if (res && res.data && typeof res.data.gee_available === 'boolean') {
+          setGeeStatus(res.data.gee_available ? 'connected' : 'unavailable');
+        } else {
+          setGeeStatus('unverified');
+        }
+      })
+      .catch(() => {
+        if (isMounted) setGeeStatus('unverified');
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Map Layer Controls
   const getInitialLayer = () => {
@@ -232,11 +264,11 @@ export default function AOIAnalysis() {
     layerOpacityRef.current = layerOpacity;
   }, [layerOpacity]);
 
-  // Sync ref to allow Leaflet event handlers access to latest state
-  const stateRef = useRef({ drawMode, polygonPoints, boxStart, clickRadiusKm });
+  // Sync ref to allow map event handlers access to latest state
+  const stateRef = useRef({ drawMode, polygonPoints, boxStart, clickRadiusKm, radiusCenter });
   useEffect(() => {
-    stateRef.current = { drawMode, polygonPoints, boxStart, clickRadiusKm };
-  }, [drawMode, polygonPoints, boxStart, clickRadiusKm]);
+    stateRef.current = { drawMode, polygonPoints, boxStart, clickRadiusKm, radiusCenter };
+  }, [drawMode, polygonPoints, boxStart, clickRadiusKm, radiusCenter]);
 
   // Compute surface area in km² from lat/lng array
   const calculateAreaFromLatLngs = (latLngArray) => {
@@ -326,8 +358,8 @@ export default function AOIAnalysis() {
         type: 'fill',
         source: 'aoi-source',
         paint: {
-          'fill-color': '#3b82f6',
-          'fill-opacity': 0.22,
+          'fill-color': '#2563eb',
+          'fill-opacity': 0.25,
         },
       });
     }
@@ -338,9 +370,9 @@ export default function AOIAnalysis() {
         type: 'line',
         source: 'aoi-source',
         paint: {
-          'line-color': '#2563eb',
+          'line-color': '#1d4ed8',
           'line-width': 2.5,
-          'line-dasharray': [4, 4],
+          'line-opacity': 0.95,
         },
       });
     }
@@ -524,7 +556,9 @@ export default function AOIAnalysis() {
             renderAoiOnMap(newGeom);
           }
         } else if (curMode === 'radius') {
-          handleMapClickPoint(lat, lng, stateRef.current.clickRadiusKm);
+          if (handleMapClickPointRef.current) {
+            handleMapClickPointRef.current(lat, lng, stateRef.current.clickRadiusKm);
+          }
         }
       });
 
@@ -558,6 +592,10 @@ export default function AOIAnalysis() {
       if (resizeTimer1) clearTimeout(resizeTimer1);
       if (resizeTimer2) clearTimeout(resizeTimer2);
       if (ro) ro.disconnect();
+      if (radiusMarkerRef.current) {
+        radiusMarkerRef.current.remove();
+        radiusMarkerRef.current = null;
+      }
       markersRef.current.forEach((m) => m.remove());
       markersRef.current = [];
       if (mapInstance.current) {
@@ -725,11 +763,53 @@ export default function AOIAnalysis() {
     setPolygonPoints((prev) => prev.slice(0, -1));
   };
 
+  // Center pin marker for Radius AOI
+  const updateRadiusCenterMarker = useCallback((lat, lng, radiusKm) => {
+    const map = mapInstance.current;
+    if (!map) return;
+
+    if (radiusMarkerRef.current) {
+      radiusMarkerRef.current.remove();
+      radiusMarkerRef.current = null;
+    }
+
+    const el = document.createElement('div');
+    el.className = 'radius-center-pin';
+    el.style.width = '26px';
+    el.style.height = '26px';
+    el.style.borderRadius = '50%';
+    el.style.background = '#2563eb';
+    el.style.color = '#ffffff';
+    el.style.fontSize = '12px';
+    el.style.fontWeight = '700';
+    el.style.display = 'flex';
+    el.style.alignItems = 'center';
+    el.style.justifyContent = 'center';
+    el.style.border = '2px solid #ffffff';
+    el.style.boxShadow = '0 2px 8px rgba(0,0,0,0.35)';
+    el.style.cursor = 'crosshair';
+    el.style.pointerEvents = 'none';
+    el.title = `Center: ${lat.toFixed(4)}°N, ${lng.toFixed(4)}°E (${radiusKm} km radius)`;
+    el.innerText = '📍';
+
+    const marker = new Marker({ element: el })
+      .setLngLat([lng, lat])
+      .addTo(map);
+
+    radiusMarkerRef.current = marker;
+  }, []);
+
   // Clear current drawing
-  const clearCurrentDrawing = () => {
+  const clearCurrentDrawing = useCallback(() => {
     setPolygonPoints([]);
     setBoxStart(null);
     setBoxPreview(null);
+    setRadiusCenter(null);
+    radiusCenterRef.current = null;
+    if (radiusMarkerRef.current) {
+      radiusMarkerRef.current.remove();
+      radiusMarkerRef.current = null;
+    }
     markersRef.current.forEach((m) => m.remove());
     markersRef.current = [];
     const map = mapInstance.current;
@@ -737,30 +817,38 @@ export default function AOIAnalysis() {
       const src = map.getSource('draw-preview-source');
       if (src) src.setData({ type: 'FeatureCollection', features: [] });
     }
-  };
+  }, []);
 
   // Handle Point & Radius Selection
-  const handleMapClickPoint = (lat, lng, radiusKm) => {
-    const radiusMeters = radiusKm * 1000;
-    const points = [];
-    const earthRadius = 6378137;
-    for (let i = 0; i <= 32; i++) {
-      const angle = (i * 2 * Math.PI) / 32;
-      const dLat = (radiusMeters * Math.sin(angle)) / earthRadius;
-      const dLng = (radiusMeters * Math.cos(angle)) / (earthRadius * Math.cos((lat * Math.PI) / 180));
-      const pLat = lat + (dLat * 180) / Math.PI;
-      const pLng = lng + (dLng * 180) / Math.PI;
-      points.push([Number(pLng.toFixed(5)), Number(pLat.toFixed(5))]);
-    }
+  const handleMapClickPoint = useCallback((lat, lng, radiusKm) => {
+    const radKm = Number(radiusKm) || 2;
+    setRadiusCenter({ lat, lng });
+    radiusCenterRef.current = { lat, lng };
 
-    const newGeom = {
-      type: 'Polygon',
-      coordinates: [points],
-    };
+    const newGeom = createCircularPolygon(lat, lng, radKm);
+    const approxArea = Math.round(Math.PI * radKm * radKm * 100) / 100;
+
     setGeometry(newGeom);
-    setAoiName(`Radial Buffer (${lat.toFixed(3)}°N, ${lng.toFixed(3)}°E, r=${radiusKm}km)`);
+    setAoiAreaApprox(approxArea);
+    setAoiName(`Radial Buffer (${lat.toFixed(3)}°N, ${lng.toFixed(3)}°E, r=${radKm}km)`);
+
     renderAoiOnMap(newGeom);
-  };
+    updateRadiusCenterMarker(lat, lng, radKm);
+  }, [renderAoiOnMap, updateRadiusCenterMarker]);
+
+  useEffect(() => {
+    handleMapClickPointRef.current = handleMapClickPoint;
+  }, [handleMapClickPoint]);
+
+  // Handle Radius Change (re-evaluates current center without duplicate layers or stale geometry)
+  const handleRadiusChange = useCallback((newRadiusKm) => {
+    const r = Number(newRadiusKm) || 2;
+    setClickRadiusKm(r);
+    const center = radiusCenterRef.current;
+    if (center && center.lat != null && center.lng != null) {
+      handleMapClickPoint(center.lat, center.lng, r);
+    }
+  }, [handleMapClickPoint]);
 
   // Select Preset Hotspot
   const selectPreset = (preset) => {
@@ -992,10 +1080,34 @@ export default function AOIAnalysis() {
         </div>
 
         <div className="flex items-center gap-3 shrink-0">
-          <div className="px-3.5 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-700 flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            Google Earth Engine Pipeline Enabled
-          </div>
+          {geeStatus === 'connected' ? (
+            <div
+              id="gee-status-badge"
+              className="px-3.5 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-700 flex items-center gap-2"
+              title="Backend Google Earth Engine service is authenticated and connected"
+            >
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              Google Earth Engine Connected
+            </div>
+          ) : geeStatus === 'unavailable' ? (
+            <div
+              id="gee-status-badge"
+              className="px-3.5 py-1.5 rounded-lg bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-800 flex items-center gap-2"
+              title="Backend Google Earth Engine is offline/unauthenticated. Analysis runs in demo calibration mode."
+            >
+              <span className="w-2 h-2 rounded-full bg-amber-500"></span>
+              Demo Mode — Live GEE Unavailable
+            </div>
+          ) : (
+            <div
+              id="gee-status-badge"
+              className="px-3.5 py-1.5 rounded-lg bg-gray-100 border border-gray-200 text-xs font-semibold text-gray-600 flex items-center gap-2"
+              title="Checking Google Earth Engine connection status..."
+            >
+              <span className="w-2 h-2 rounded-full bg-gray-400"></span>
+              GEE Status Unverified
+            </div>
+          )}
           <div className="px-3.5 py-1.5 rounded-lg bg-blue-50 border border-blue-200 text-xs font-semibold text-blue-700">
             🌲 Random Forest Model (15 Features)
           </div>
@@ -1083,9 +1195,15 @@ export default function AOIAnalysis() {
               </button>
 
               <button
+                id="draw-mode-radius-btn"
                 onClick={() => {
                   setDrawMode('radius');
                   clearCurrentDrawing();
+                  if (radiusCenterRef.current) {
+                    handleMapClickPoint(radiusCenterRef.current.lat, radiusCenterRef.current.lng, clickRadiusKm);
+                  } else {
+                    renderAoiOnMap(null);
+                  }
                 }}
                 className={`py-2 px-2.5 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 ${
                   drawMode === 'radius'
@@ -1191,15 +1309,21 @@ export default function AOIAnalysis() {
 
             {drawMode === 'radius' && (
               <div className="p-3 bg-emerald-50/70 rounded-xl border border-emerald-200 flex flex-wrap items-center justify-between gap-3 text-xs">
-                <span className="text-emerald-900 font-medium">
-                  👉 Click anywhere on the map to place an AOI circular buffer.
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse"></span>
+                  <span className="text-emerald-900 font-medium">
+                    {radiusCenter
+                      ? `📍 Circular AOI: ${clickRadiusKm} km radius centered at ${radiusCenter.lat.toFixed(4)}°N, ${radiusCenter.lng.toFixed(4)}°E. Click map to reposition.`
+                      : `👉 Click anywhere on the map to place a ${clickRadiusKm} km circular AOI buffer.`}
+                  </span>
+                </div>
                 <div className="flex items-center gap-2">
                   <span className="text-gray-600 font-medium">Radius:</span>
                   {[2, 5, 10, 15, 20].map((r) => (
                     <button
                       key={r}
-                      onClick={() => setClickRadiusKm(r)}
+                      id={`radius-option-${r}km`}
+                      onClick={() => handleRadiusChange(r)}
                       className={`px-2.5 py-1 rounded-md font-bold transition-all ${
                         clickRadiusKm === r
                           ? 'bg-emerald-600 text-white shadow-sm'
@@ -1209,6 +1333,18 @@ export default function AOIAnalysis() {
                       {r} km
                     </button>
                   ))}
+                  {radiusCenter && (
+                    <button
+                      onClick={() => {
+                        clearCurrentDrawing();
+                        renderAoiOnMap(null);
+                      }}
+                      className="px-2 py-1 bg-white border border-red-200 hover:bg-red-50 text-red-600 rounded-md font-medium text-[11px] transition-all ml-1"
+                      title="Clear circular AOI"
+                    >
+                      🗑 Clear
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -1618,9 +1754,28 @@ export default function AOIAnalysis() {
               {/* Report Generation Action Banner */}
               <div className="bg-gradient-to-r from-brand-600 via-indigo-600 to-emerald-600 rounded-2xl p-4 text-white shadow-md flex flex-col sm:flex-row items-center justify-between gap-3">
                 <div className="space-y-0.5 text-center sm:text-left">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-white/90 bg-white/20 px-2 py-0.5 rounded-full inline-block mb-1">
-                    Analysis Completed
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2 mb-1 justify-center sm:justify-start">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-white/90 bg-white/20 px-2 py-0.5 rounded-full inline-block">
+                      Analysis Completed
+                    </span>
+                    {analysisResult.is_live && !analysisResult.is_demo ? (
+                      <span
+                        id="aoi-provenance-banner-badge"
+                        className="text-[10px] font-bold uppercase tracking-wider bg-emerald-400/30 text-emerald-100 border border-emerald-300/40 px-2 py-0.5 rounded-full inline-flex items-center gap-1"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-300"></span>
+                        Live Satellite Analysis
+                      </span>
+                    ) : (
+                      <span
+                        id="aoi-provenance-banner-badge"
+                        className="text-[10px] font-bold uppercase tracking-wider bg-amber-400/30 text-amber-100 border border-amber-300/40 px-2 py-0.5 rounded-full inline-flex items-center gap-1"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-300"></span>
+                        Synthetic / Demo Analysis
+                      </span>
+                    )}
+                  </div>
                   <h4 className="text-sm font-bold">Formal Environmental Audit Report Ready</h4>
                   <p className="text-xs text-white/90">
                     Generate an audit report for this {aoiAreaApprox} km² footprint with PDF, CSV, and GeoJSON export.
@@ -1637,13 +1792,58 @@ export default function AOIAnalysis() {
                 </button>
               </div>
 
+              {/* Data Provenance & Transparency Notice if not live satellite data */}
+              {(!analysisResult.is_live || analysisResult.is_demo) && (
+                <div
+                  id="aoi-demo-transparency-notice"
+                  className="p-3.5 bg-amber-50/90 border border-amber-200 rounded-2xl flex items-start gap-3 text-xs text-amber-900 shadow-sm"
+                >
+                  <span className="text-base p-1 bg-amber-100 rounded-lg shrink-0">ℹ️</span>
+                  <div className="space-y-0.5">
+                    <div className="font-bold text-amber-950 flex items-center gap-2">
+                      <span>Demo Mode — Synthetic Feature Calibration</span>
+                      <span className="text-[10px] bg-amber-200/80 text-amber-900 px-2 py-0.5 rounded-full font-mono uppercase tracking-wider">
+                        Synthetic Source
+                      </span>
+                    </div>
+                    <p className="text-amber-800 text-[11px] leading-relaxed">
+                      Google Earth Engine is not active in this backend deployment. The Random Forest model scored synthetic calibration features rather than live satellite-derived spectral reflectance.
+                    </p>
+                    {analysisResult.source && (
+                      <div className="text-[10px] text-amber-700 font-mono mt-1 pt-1 border-t border-amber-200/60">
+                        Data Source: {analysisResult.source}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* ML Risk Score & Prediction Card */}
               <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100 space-y-4">
                 <div className="flex items-center justify-between border-b border-gray-100 pb-3">
                   <div>
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400">
-                      Machine Learning Decision
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400">
+                        Machine Learning Decision
+                      </span>
+                      {analysisResult.is_live && !analysisResult.is_demo ? (
+                        <span
+                          id="aoi-result-source-badge"
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1"
+                        >
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                          Live Sentinel-2
+                        </span>
+                      ) : (
+                        <span
+                          id="aoi-result-source-badge"
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-50 text-amber-800 border border-amber-200 flex items-center gap-1"
+                        >
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                          Synthetic / Demo
+                        </span>
+                      )}
+                    </div>
                     <h3 className="text-base font-bold text-gray-900 mt-0.5">
                       {analysisResult.ml_result.label}
                     </h3>
@@ -1830,7 +2030,7 @@ export default function AOIAnalysis() {
                     <span>🛡️</span> Prescribed Advisory Protocol
                   </span>
                   <span className="text-[10px] text-gray-400 font-mono">
-                    Status: {analysisResult.is_live ? 'Live Observation' : 'Reference / Demonstration'}
+                    Status: {analysisResult.is_live && !analysisResult.is_demo ? 'Live Observation' : 'Reference / Demonstration'}
                   </span>
                 </div>
                 <p className="text-gray-300 leading-relaxed">
@@ -1842,7 +2042,7 @@ export default function AOIAnalysis() {
                 </p>
                 <div className="pt-2 border-t border-surface-700 flex items-center justify-between text-[11px] text-gray-400">
                   <span title={analysisResult.source}>Source: {analysisResult.source?.length > 40 ? `${analysisResult.source.substring(0, 40)}...` : analysisResult.source}</span>
-                  <span>Sensor: {analysisResult.is_live ? 'Sentinel-2 L2A (Harmonized)' : 'Pilot Reference Dataset'}</span>
+                  <span>Sensor: {analysisResult.is_live && !analysisResult.is_demo ? 'Sentinel-2 L2A (Harmonized)' : 'Synthetic Calibration Dataset'}</span>
                 </div>
               </div>
 

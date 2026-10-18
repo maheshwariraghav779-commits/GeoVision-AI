@@ -1,5 +1,34 @@
 const API_BASE = '/api';
 
+let _healthCache = null;
+let _healthPromise = null;
+
+/**
+ * Fetch and cache the backend health status (/api/health).
+ * Reuses in-flight promise and memory cache to prevent redundant polling.
+ */
+export async function getHealthStatus(forceRefresh = false) {
+  if (!forceRefresh && _healthCache) {
+    return _healthCache;
+  }
+  if (!forceRefresh && _healthPromise) {
+    return _healthPromise;
+  }
+  _healthPromise = apiFetch('/health')
+    .then((res) => {
+      if (res && res.data) {
+        _healthCache = res;
+      }
+      _healthPromise = null;
+      return res;
+    })
+    .catch((err) => {
+      _healthPromise = null;
+      return { data: null, error: err?.message || 'Failed to fetch health status' };
+    });
+  return _healthPromise;
+}
+
 export async function apiFetch(endpoint, options = {}) {
   try {
     const { timeout = 30000, signal, ...customOptions } = options;
