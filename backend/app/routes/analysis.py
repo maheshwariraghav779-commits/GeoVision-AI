@@ -6,6 +6,7 @@ Year-to-Year and Month-Wise environmental change analysis powered by Google Eart
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import math
 from typing import Optional, Dict, Any, List
 import logging
 from fastapi import APIRouter, Query, HTTPException
@@ -77,12 +78,13 @@ async def get_temporal_analysis(
     source = demo_data.get_source()
 
     # Build custom geometry if coordinates provided
-    lat_val = lat if isinstance(lat, (int, float)) else None
-    lng_val = lng if isinstance(lng, (int, float)) else None
+    lat_val = lat if isinstance(lat, (int, float)) else 18.5204
+    lng_val = lng if isinstance(lng, (int, float)) else 73.8567
     radius_val = radius_km if isinstance(radius_km, (int, float)) else 5.0
+    is_custom_location = (lat is not None and lng is not None) or (radius_km is not None and radius_km != 5.0)
 
     custom_geom = None
-    if lat_val is not None and lng_val is not None and gee_service.is_connected:
+    if gee_service.is_connected:
         try:
             import ee
             r_meters = radius_val * 1000.0
@@ -99,17 +101,20 @@ async def get_temporal_analysis(
                 start_month=start_month,
                 end_month=end_month,
                 geometry=custom_geom,
+                radius_km=radius_val,
+                center_lat=lat_val,
+                center_lng=lng_val,
             )
             is_live = True
             source = "Copernicus Sentinel-2 Level-2A via Google Earth Engine"
             summary_dict = dict(live_data["summary"])
-            if lat_val is not None and lng_val is not None:
+            if is_custom_location:
                 summary_dict["region"] = f"Custom Location ({lat_val:.4f}°N, {lng_val:.4f}°E, r={radius_val}km)"
                 summary_dict["target_coordinates"] = {"lat": lat_val, "lng": lng_val}
                 summary_dict["radius_km"] = radius_val
                 summary_dict["is_default_location"] = False
             else:
-                summary_dict["region"] = "Pune Pilot Study Area (Default Regional Baseline)"
+                summary_dict["region"] = "Pune Pilot Study Area (Default Regional Baseline, r=5km)"
                 summary_dict["target_coordinates"] = {"lat": 18.5204, "lng": 73.8567}
                 summary_dict["radius_km"] = 5.0
                 summary_dict["is_default_location"] = True
@@ -169,14 +174,14 @@ async def get_temporal_analysis(
         net_ndwi = round(yearly_progression[-1].ndwi_mean - yearly_progression[0].ndwi_mean, 4)
         net_ndbi = round(yearly_progression[-1].ndbi_mean - yearly_progression[0].ndbi_mean, 4)
 
-        is_default = (lat_val is None or lng_val is None)
+        is_default = not is_custom_location
         region_label = (
-            "Pune Pilot Area, Maharashtra (Default Baseline)"
+            "Pune Pilot Area, Maharashtra (Default Baseline, r=5km)"
             if is_default
             else f"Custom Demonstration Zone ({lat_val:.4f}°N, {lng_val:.4f}°E, r={radius_val}km)"
         )
 
-        calc_area = round(3.14159 * (radius_val ** 2), 2) if not is_default else 78.54
+        calc_area = round(math.pi * (radius_val ** 2), 2)
         summary_dict = {
             "start_year": start_year,
             "end_year": end_year,
@@ -184,6 +189,7 @@ async def get_temporal_analysis(
             "end_month": end_month,
             "region": region_label,
             "total_area_km2": calc_area,
+            "geometry_area_km2": calc_area,
             "vegetation_loss_km2": round(abs(min(0.0, net_ndvi)) * (calc_area * 0.5), 2),
             "disturbance_km2": round(max(0.0, net_ndbi) * (calc_area * 0.4), 2),
             "water_expansion_km2": round(max(0.0, net_ndwi) * (calc_area * 0.3), 2),
@@ -193,9 +199,16 @@ async def get_temporal_analysis(
             "dominant_risk": "Vegetation Loss" if abs(net_ndvi) >= abs(net_ndbi) else "Land Disturbance",
             "risk_level": "High" if abs(net_ndvi) >= 0.10 else "Medium",
             "risk_score": min(100, int(abs(net_ndvi) * 350 + max(0, net_ndbi) * 200)),
-            "target_coordinates": {"lat": lat_val or 18.5204, "lng": lng_val or 73.8567},
+            "target_coordinates": {"lat": lat_val, "lng": lng_val},
             "radius_km": radius_val,
             "is_default_location": is_default,
+            "metadata": {
+                "target_coordinates": {"lat": lat_val, "lng": lng_val},
+                "radius_km": radius_val,
+                "geometry_area_km2": calc_area,
+                "is_real_observation": False,
+                "execution_mode": "synthetic_demonstration",
+            },
         }
 
     # Fetch corresponding hotspots

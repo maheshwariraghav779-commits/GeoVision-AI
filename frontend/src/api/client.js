@@ -1,4 +1,4 @@
-const API_BASE = '/api';
+const API_BASE = typeof window !== 'undefined' ? '/api' : 'http://127.0.0.1:8000/api';
 
 let _healthCache = null;
 let _healthPromise = null;
@@ -30,36 +30,46 @@ export async function getHealthStatus(forceRefresh = false) {
 }
 
 export async function apiFetch(endpoint, options = {}) {
-  try {
-    const { timeout = 30000, signal, ...customOptions } = options;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
+  const { timeout = 60000, signal, ...customOptions } = options;
+  const controller = new AbortController();
+  let isTimeout = false;
+  const timer = setTimeout(() => {
+    isTimeout = true;
+    controller.abort();
+  }, timeout);
 
-    if (signal) {
-      if (signal.aborted) {
-        controller.abort();
-      } else {
-        signal.addEventListener('abort', () => controller.abort(), { once: true });
-      }
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener('abort', () => controller.abort(), { once: true });
     }
+  }
 
+  try {
     const res = await fetch(`${API_BASE}${endpoint}`, {
       ...customOptions,
       signal: controller.signal,
     });
-    clearTimeout(timer);
 
     if (!res.ok) {
       const errJson = await res.json().catch(() => null);
       throw new Error(errJson?.detail || `API ${res.status}: ${res.statusText}`);
     }
-    return { data: await res.json(), error: null };
+    return { data: await res.json(), error: null, isAborted: false, isTimeout: false };
   } catch (err) {
     if (err.name === 'AbortError') {
-      return { data: null, error: 'Request was cancelled or timed out.', isAborted: true };
+      return {
+        data: null,
+        error: isTimeout ? 'Request timed out. The satellite computation took longer than expected.' : 'Request was cancelled.',
+        isAborted: true,
+        isTimeout,
+      };
     }
     console.error(`[API] ${endpoint}:`, err);
-    return { data: null, error: err.message };
+    return { data: null, error: err.message, isAborted: false, isTimeout: false };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

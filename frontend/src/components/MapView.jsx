@@ -148,9 +148,11 @@ export default function MapView({
     const loadTiles = async () => {
       setLoadingTiles(true);
       setTileError(null);
-      const { data, error: err } = await apiFetch(
-        `/gee/tiles?start_year=${startYear}&end_year=${endYear}&start_month=${startMonth}&end_month=${endMonth}`
-      );
+      let tileQuery = `/gee/tiles?start_year=${startYear}&end_year=${endYear}&start_month=${startMonth}&end_month=${endMonth}`;
+      if (pinLocation && pinLocation.lat != null && pinLocation.lng != null) {
+        tileQuery += `&lat=${pinLocation.lat}&lng=${pinLocation.lng}&radius_km=${pinLocation.radiusKm || 5.0}`;
+      }
+      const { data, error: err } = await apiFetch(tileQuery);
       if (!isMounted) return;
 
       if (err) {
@@ -169,7 +171,7 @@ export default function MapView({
     return () => {
       isMounted = false;
     };
-  }, [startYear, endYear, startMonth, endMonth, defaultLayer]);
+  }, [startYear, endYear, startMonth, endMonth, defaultLayer, pinLocation?.lat, pinLocation?.lng, pinLocation?.radiusKm]);
 
   // Filter hotspots based on module filter
   const filteredHotspots = hotspots.filter((h) => {

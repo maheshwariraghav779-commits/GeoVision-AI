@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { apiFetch } from '../api/client';
 import LoadingState from '../components/LoadingState';
 import ErrorState from '../components/ErrorState';
@@ -44,31 +44,84 @@ export default function TemporalAnalysis() {
   const [error, setError] = useState(null);
   const [data, setData] = useState(null);
 
-  const fetchAnalysis = async () => {
+  // In-flight request cancellation and race condition prevention
+  const abortControllerRef = useRef(null);
+  const requestIdRef = useRef(0);
+  const debounceTimerRef = useRef(null);
+
+  const fetchAnalysis = async (overrides = {}) => {
+    // 1. Safely abort prior in-flight request so newer request takes precedence
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    // Track sequential request ID to guarantee stale responses never overwrite newer ones
+    const currentRequestId = ++requestIdRef.current;
+
     setLoading(true);
     setError(null);
     try {
-      const query = `/analysis/temporal?start_year=${startYear}&end_year=${endYear}&start_month=${startMonth}&end_month=${endMonth}&module=${selectedModule}&lat=${lat}&lng=${lng}&radius_km=${radiusKm}`;
-      const { data: res, error: err } = await apiFetch(query);
+      const qStartYear = overrides.startYear ?? startYear;
+      const qEndYear = overrides.endYear ?? endYear;
+      const qStartMonth = overrides.startMonth ?? startMonth;
+      const qEndMonth = overrides.endMonth ?? endMonth;
+      const qModule = overrides.module ?? selectedModule;
+      const qLat = overrides.lat ?? lat;
+      const qLng = overrides.lng ?? lng;
+      const qRadius = overrides.radius ?? radiusKm;
+
+      const query = `/analysis/temporal?start_year=${qStartYear}&end_year=${qEndYear}&start_month=${qStartMonth}&end_month=${qEndMonth}&module=${qModule}&lat=${qLat}&lng=${qLng}&radius_km=${qRadius}`;
+      const { data: res, error: err, isAborted, isTimeout } = await apiFetch(query, {
+        signal: controller.signal,
+        timeout: 90000,
+      });
+
+      // If a newer request has started, discard this result silently
+      if (currentRequestId !== requestIdRef.current) {
+        return;
+      }
+
       if (err) {
+        // If aborted because a newer request superseded it, ignore
+        if (isAborted && !isTimeout) {
+          return;
+        }
         setError(err);
         return;
       }
       setData(res);
     } catch (err) {
-      setError(err.message || 'Failed to complete temporal analysis');
+      if (currentRequestId === requestIdRef.current) {
+        setError(err.message || 'Failed to complete temporal analysis');
+      }
     } finally {
-      setLoading(false);
+      if (currentRequestId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
     fetchAnalysis();
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
   }, []);
 
   const handlePresetSelect = (preset) => {
     setStartMonth(preset.start);
     setEndMonth(preset.end);
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    fetchAnalysis({ startMonth: preset.start, endMonth: preset.end });
   };
 
   const handleLocationPresetChange = (idx) => {
@@ -78,7 +131,23 @@ export default function TemporalAnalysis() {
       setLat(chosen.lat);
       setLng(chosen.lng);
       setRadiusKm(chosen.radius);
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+      fetchAnalysis({ lat: chosen.lat, lng: chosen.lng, radius: chosen.radius });
     }
+  };
+
+  const handleMapLocationChange = ({ lat: newLat, lng: newLng }) => {
+    setLat(newLat);
+    setLng(newLng);
+    setLocationPresetIdx(LOCATION_PRESETS.length - 1);
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = setTimeout(() => {
+      fetchAnalysis({ lat: newLat, lng: newLng });
+    }, 400);
   };
 
   return (
@@ -107,15 +176,15 @@ export default function TemporalAnalysis() {
           </p>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <span className="text-xs px-2.5 py-1 rounded-md bg-gray-100 font-mono text-gray-700">
-              📍 Target: {data?.summary?.region || `${lat}°N, ${lng}°E`} (Radius: {radiusKm} km)
+              📍 Target: {data?.summary?.region || `${lat.toFixed(4)}°N, ${lng.toFixed(4)}°E`} (Radius: {data?.summary?.radius_km ?? radiusKm} km)
             </span>
             {data?.summary?.is_default_location ? (
               <span className="text-xs px-2.5 py-1 rounded-md bg-blue-50 text-blue-700 border border-blue-200">
-                ℹ️ Default Pune Baseline Active — Select Custom Coordinates to Analyze Other Sites
+                ℹ️ Default Pune Baseline Active (5.0 km) — Select Custom Coordinates or Radius to Analyze Other Sites
               </span>
             ) : (
               <span className="text-xs px-2.5 py-1 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold">
-                ✓ User Custom Location Active ({lat.toFixed(4)}°N, {lng.toFixed(4)}°E)
+                ✓ Custom AOI Active ({data?.summary?.target_coordinates?.lat?.toFixed(4) || lat.toFixed(4)}°N, {data?.summary?.target_coordinates?.lng?.toFixed(4) || lng.toFixed(4)}°E, r={data?.summary?.radius_km ?? radiusKm} km)
               </span>
             )}
           </div>
@@ -272,14 +341,20 @@ export default function TemporalAnalysis() {
               <label className="block text-xs font-medium text-gray-600 mb-1">Analysis Radius</label>
               <select
                 value={radiusKm}
-                onChange={(e) => setRadiusKm(Number(e.target.value))}
+                onChange={(e) => {
+                  const newRadius = Number(e.target.value);
+                  setRadiusKm(newRadius);
+                  fetchAnalysis({ radius: newRadius });
+                }}
                 className="w-full bg-surface-50 border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-brand-500 font-mono"
               >
                 <option value={1.0}>1.0 km (Local Site ~3.1 km²)</option>
                 <option value={3.0}>3.0 km (Sector ~28.3 km²)</option>
                 <option value={5.0}>5.0 km (District ~78.5 km²)</option>
-                <option value={10.0}>10.0 km (Regional ~314 km²)</option>
-                <option value={15.0}>15.0 km (Watershed ~706 km²)</option>
+                <option value={10.0}>10.0 km (Regional ~314.2 km²)</option>
+                <option value={15.0}>15.0 km (Watershed ~706.9 km²)</option>
+                <option value={20.0}>20.0 km (Sub-basin ~1,256.6 km²)</option>
+                <option value={25.0}>25.0 km (Landscape ~1,963.5 km²)</option>
               </select>
             </div>
 
@@ -333,24 +408,24 @@ export default function TemporalAnalysis() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <StatCard
               title={`Vegetation Shift (${data.summary.start_year}→${data.summary.end_year})`}
-              value={`${data.summary.net_ndvi_change > 0 ? '+' : ''}${data.summary.net_ndvi_change.toFixed(4)}`}
-              subtitle={`Est. Area: ${data.summary.vegetation_loss_km2} km² affected`}
+              value={data.summary.net_ndvi_change != null ? `${data.summary.net_ndvi_change > 0 ? '+' : ''}${data.summary.net_ndvi_change.toFixed(4)}` : 'N/A'}
+              subtitle={`Est. Area: ${data.summary.vegetation_loss_km2 ?? 0} km² affected`}
               icon="🌳"
-              color={data.summary.net_ndvi_change < -0.05 ? 'red' : 'green'}
+              color={(data.summary.net_ndvi_change ?? 0) < -0.05 ? 'red' : 'green'}
             />
             <StatCard
               title="Surface Disturbance"
-              value={`${data.summary.net_ndbi_change > 0 ? '+' : ''}${data.summary.net_ndbi_change.toFixed(4)}`}
-              subtitle={`Est. Disturbed: ${data.summary.disturbance_km2} km²`}
+              value={data.summary.net_ndbi_change != null ? `${data.summary.net_ndbi_change > 0 ? '+' : ''}${data.summary.net_ndbi_change.toFixed(4)}` : 'N/A'}
+              subtitle={`Est. Disturbed: ${data.summary.disturbance_km2 ?? 0} km²`}
               icon="⛏️"
-              color={data.summary.net_ndbi_change > 0.05 ? 'yellow' : 'blue'}
+              color={(data.summary.net_ndbi_change ?? 0) > 0.05 ? 'yellow' : 'blue'}
             />
             <StatCard
               title="Water-Extent Delta"
-              value={`${data.summary.net_ndwi_change > 0 ? '+' : ''}${data.summary.net_ndwi_change.toFixed(4)}`}
-              subtitle={`Expansion Area: ${data.summary.water_expansion_km2} km²`}
+              value={data.summary.net_ndwi_change != null ? `${data.summary.net_ndwi_change > 0 ? '+' : ''}${data.summary.net_ndwi_change.toFixed(4)}` : 'N/A'}
+              subtitle={`Expansion Area: ${data.summary.water_expansion_km2 ?? 0} km²`}
               icon="🌊"
-              color={data.summary.net_ndwi_change > 0.05 ? 'blue' : 'gray'}
+              color={(data.summary.net_ndwi_change ?? 0) > 0.05 ? 'blue' : 'gray'}
             />
             <div className="stat-card bg-white rounded-xl border-l-4 border-purple-500 p-5 shadow-sm">
               <div className="flex items-start justify-between">
@@ -380,7 +455,7 @@ export default function TemporalAnalysis() {
               </div>
               <div className="flex items-center gap-2 text-xs text-gray-500">
                 <span className="px-2.5 py-1 rounded-md bg-gray-100 font-mono">
-                  AOI: {data.summary.region} (Area: {data.summary.total_area_km2 || (Math.PI * radiusKm * radiusKm).toFixed(2)} km²)
+                  AOI: {data.summary.region} (AOI Footprint: {data.summary.geometry_area_km2 || data.summary.total_area_km2 || (Math.PI * (data.summary.radius_km || radiusKm) ** 2).toFixed(2)} km²)
                 </span>
               </div>
             </div>
@@ -395,31 +470,38 @@ export default function TemporalAnalysis() {
               height="500px"
               isDemo={!data.is_live}
               center={[lat, lng]}
-              pinLocation={{ lat, lng, radiusKm }}
-              onLocationChange={({ lat: newLat, lng: newLng }) => {
-                setLat(newLat);
-                setLng(newLng);
-                setLocationPresetIdx(LOCATION_PRESETS.length - 1);
-              }}
+              pinLocation={{ lat, lng, radiusKm: data.summary.radius_km || radiusKm }}
+              onLocationChange={handleMapLocationChange}
             />
 
             {/* Actual Analysis Geometry and Scope Details */}
             <div className="mt-4 p-3.5 bg-slate-50 border border-slate-200 rounded-lg text-xs grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-slate-700">
               <div>
                 <span className="font-semibold block text-slate-900">📍 Center Coordinates:</span>
-                <span className="font-mono">{data.summary.target_coordinates?.lat?.toFixed(4) || lat.toFixed(4)}°N, {data.summary.target_coordinates?.lng?.toFixed(4) || lng.toFixed(4)}°E</span>
+                <span className="font-mono">
+                  {data.summary.target_coordinates?.lat != null
+                    ? `${data.summary.target_coordinates.lat.toFixed(4)}°N, ${data.summary.target_coordinates.lng.toFixed(4)}°E`
+                    : `${lat.toFixed(4)}°N, ${lng.toFixed(4)}°E`}
+                </span>
               </div>
               <div>
                 <span className="font-semibold block text-slate-900">📐 Radial Footprint:</span>
-                <span>{data.summary.radius_km || radiusKm} km radius (~{data.summary.total_area_km2 || (Math.PI * radiusKm * radiusKm).toFixed(2)} km²)</span>
+                <span>
+                  {data.summary.radius_km ?? radiusKm} km radius (~{data.summary.geometry_area_km2 || data.summary.total_area_km2 || (Math.PI * (data.summary.radius_km ?? radiusKm) ** 2).toFixed(2)} km² AOI)
+                </span>
               </div>
               <div>
                 <span className="font-semibold block text-slate-900">📅 Observation Dates:</span>
-                <span>{data.summary.start_year} (M{String(data.summary.start_month || startMonth).padStart(2, '0')}) &rarr; {data.summary.end_year} (M{String(data.summary.end_month || endMonth).padStart(2, '0')})</span>
+                <span>
+                  {data.summary.start_year} (M{String(data.summary.start_month || startMonth).padStart(2, '0')}) &rarr; {data.summary.end_year} (M{String(data.summary.end_month || endMonth).padStart(2, '0')})
+                </span>
               </div>
               <div>
                 <span className="font-semibold block text-slate-900">🛰️ Data Provenance:</span>
-                <span>{data.source}</span>
+                <span>
+                  {data.source}
+                  {data.summary.metadata?.cached ? ' (Cached Result)' : ''}
+                </span>
               </div>
             </div>
 
@@ -484,15 +566,21 @@ export default function TemporalAnalysis() {
                   <div className="space-y-2 text-sm mt-3">
                     <div className="flex justify-between items-center">
                       <span className="text-xs text-gray-500">NDVI (Vegetation):</span>
-                      <span className="font-mono font-semibold text-emerald-700">{yrStat.ndvi_mean.toFixed(4)}</span>
+                      <span className="font-mono font-semibold text-emerald-700">
+                        {yrStat.ndvi_mean != null ? yrStat.ndvi_mean.toFixed(4) : <span className="text-gray-400 italic font-normal text-xs">No clear data</span>}
+                      </span>
                     </div>
                     <div className="flex justify-between items-center">
                       <span className="text-xs text-gray-500">NDWI (Water):</span>
-                      <span className="font-mono font-semibold text-cyan-700">{yrStat.ndwi_mean.toFixed(4)}</span>
+                      <span className="font-mono font-semibold text-cyan-700">
+                        {yrStat.ndwi_mean != null ? yrStat.ndwi_mean.toFixed(4) : <span className="text-gray-400 italic font-normal text-xs">No clear data</span>}
+                      </span>
                     </div>
                     <div className="flex justify-between items-center">
                       <span className="text-xs text-gray-500">NDBI (Disturbance):</span>
-                      <span className="font-mono font-semibold text-amber-700">{yrStat.ndbi_mean.toFixed(4)}</span>
+                      <span className="font-mono font-semibold text-amber-700">
+                        {yrStat.ndbi_mean != null ? yrStat.ndbi_mean.toFixed(4) : <span className="text-gray-400 italic font-normal text-xs">No clear data</span>}
+                      </span>
                     </div>
                   </div>
 
@@ -533,8 +621,9 @@ export default function TemporalAnalysis() {
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {data.monthly_breakdown.map((mStat) => {
-                    const isDecline = mStat.change_val < 0;
-                    const magnitude = Math.min(100, Math.abs(mStat.change_val) * 400);
+                    const hasObs = mStat.is_observed && mStat.change_val != null;
+                    const isDecline = hasObs && mStat.change_val < 0;
+                    const magnitude = hasObs ? Math.min(100, Math.abs(mStat.change_val) * 400) : 0;
 
                     return (
                       <tr key={mStat.month_num} className="hover:bg-surface-50 transition-colors">
@@ -543,38 +632,50 @@ export default function TemporalAnalysis() {
                           {mStat.month_name}
                         </td>
                         <td className="px-4 py-3 text-center font-mono text-gray-700">
-                          {mStat.start_year_val.toFixed(4)}
+                          {mStat.start_year_val != null ? mStat.start_year_val.toFixed(4) : <span className="text-xs text-gray-400 italic">No clear data</span>}
                         </td>
                         <td className="px-4 py-3 text-center font-mono text-gray-700">
-                          {mStat.end_year_val.toFixed(4)}
+                          {mStat.end_year_val != null ? mStat.end_year_val.toFixed(4) : <span className="text-xs text-gray-400 italic">No clear data</span>}
                         </td>
                         <td className="px-4 py-3 text-center font-mono font-semibold">
-                          <span
-                            className={`inline-block px-2 py-0.5 rounded text-xs ${
-                              isDecline ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'
-                            }`}
-                          >
-                            {mStat.change_val > 0 ? '+' : ''}
-                            {mStat.change_val.toFixed(4)}
-                          </span>
+                          {hasObs ? (
+                            <span
+                              className={`inline-block px-2 py-0.5 rounded text-xs ${
+                                isDecline ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'
+                              }`}
+                            >
+                              {mStat.change_val > 0 ? '+' : ''}
+                              {mStat.change_val.toFixed(4)}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-gray-400 italic">N/A (Cloud Masked)</span>
+                          )}
                         </td>
                         <td className="px-4 py-3 w-48">
-                          <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden flex">
-                            {isDecline ? (
-                              <div
-                                className="bg-red-500 h-2.5 rounded-full"
-                                style={{ width: `${Math.max(5, magnitude)}%` }}
-                              ></div>
-                            ) : (
-                              <div
-                                className="bg-emerald-500 h-2.5 rounded-full"
-                                style={{ width: `${Math.max(5, magnitude)}%` }}
-                              ></div>
-                            )}
-                          </div>
+                          {hasObs ? (
+                            <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden flex">
+                              {isDecline ? (
+                                <div
+                                  className="bg-red-500 h-2.5 rounded-full"
+                                  style={{ width: `${Math.max(5, magnitude)}%` }}
+                                ></div>
+                              ) : (
+                                <div
+                                  className="bg-emerald-500 h-2.5 rounded-full"
+                                  style={{ width: `${Math.max(5, magnitude)}%` }}
+                                ></div>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="w-full bg-gray-100 rounded-full h-2.5 border border-dashed border-gray-200"></div>
+                          )}
                         </td>
                         <td className="px-4 py-3 text-center">
-                          {Math.abs(mStat.change_val) > 0.08 ? (
+                          {!hasObs ? (
+                            <span className="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-gray-100 text-gray-500">
+                              ☁️ Insufficient Clear Pixels
+                            </span>
+                          ) : Math.abs(mStat.change_val) > 0.08 ? (
                             <span className="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700">
                               Chronic Anomaly
                             </span>

@@ -14,6 +14,8 @@ Security:
 import os
 import json
 import logging
+import copy
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
@@ -66,6 +68,8 @@ class GEEService:
         self._last_message: str = "Earth Engine service not initialized yet."
         self._project: Optional[str] = None
         self._last_checked: Optional[datetime] = None
+        self._temporal_cache: Dict[str, Any] = {}
+        self._tile_cache: Dict[str, Any] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -287,10 +291,15 @@ class GEEService:
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", CLOUD_FILTER_PERCENT))
         )
 
+        # Retrieve actual acquisition dates of observed scenes (also yields scene count in 1 single roundtrip)
         try:
-            scenes_count = int(s2_filtered.size().getInfo() or 0)
+            dates = s2_filtered.aggregate_array("system:time_start").map(
+                lambda t: ee.Date(t).format("YYYY-MM-dd")
+            ).getInfo() or []
+            scenes_count = len(dates)
         except Exception as ex:
-            logger.warning(f"Failed to query Sentinel-2 scene count for year {year}: {ex}")
+            logger.warning(f"Failed to query Sentinel-2 scenes for year {year}: {ex}")
+            dates = []
             scenes_count = 0
 
         if scenes_count == 0:
@@ -298,14 +307,6 @@ class GEEService:
                 f"No Sentinel-2 Level-2A scenes found for year {year} in window "
                 f"{year}-{start_month:02d}-01 to {year}-{end_month:02d}-01 with cloud cover < {CLOUD_FILTER_PERCENT}%."
             )
-
-        # Retrieve actual acquisition dates of observed scenes
-        try:
-            dates = s2_filtered.aggregate_array("system:time_start").map(
-                lambda t: ee.Date(t).format("YYYY-MM-dd")
-            ).getInfo() or []
-        except Exception:
-            dates = []
 
         cs_col = ee.ImageCollection(CS_COLLECTION_ID)
         linked = s2_filtered.linkCollection(cs_col, ["cs_cdf"])
@@ -495,6 +496,7 @@ class GEEService:
         ndbi_change: ee.Image,
         ndwi_change: ee.Image,
         scale: int = 20,
+        known_geom_km2: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Calculate actual physical surface areas (in km²) using Earth Engine pixelArea()
@@ -548,12 +550,15 @@ class GEEService:
         ov_m2 = float(area_stats.get("overlap") or 0.0)
         valid_m2 = float(area_stats.get("valid_observed") or 0.0)
 
-        # Also obtain vector geodesic area
-        try:
-            geom_m2 = float(geometry.area(maxError=50).getInfo() or 0.0)
-            geom_km2 = round(geom_m2 / 1e6, 2)
-        except Exception:
-            geom_km2 = round(tot_m2 / 1e6, 2)
+        # Geodesic area of vector geometry
+        if known_geom_km2 is not None and known_geom_km2 > 0:
+            geom_km2 = float(known_geom_km2)
+        else:
+            try:
+                geom_m2 = float(geometry.area(maxError=50).getInfo() or 0.0)
+                geom_km2 = round(geom_m2 / 1e6, 2)
+            except Exception:
+                geom_km2 = round(tot_m2 / 1e6, 2)
 
         return {
             "total_area_km2": geom_km2,
@@ -608,34 +613,58 @@ class GEEService:
         start_month: int = DEFAULT_START_MONTH,
         end_month: int = DEFAULT_END_MONTH,
         geometry: Optional[ee.Geometry] = None,
+        radius_km: Optional[float] = None,
+        center_lat: Optional[float] = None,
+        center_lng: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Perform live multi-temporal satellite analysis between start_year and end_year
         producing independent annual median composites for every year without interpolation.
         Uses exact formulas and Cloud Score+ pixel screening from gee/geovision_analysis.js.
         """
-        geom_hash = "default"
-        if geometry is not None:
-            try:
-                cent = geometry.centroid(maxError=200).getInfo()["coordinates"]
-                geom_hash = f"{cent[0]:.3f}_{cent[1]:.3f}"
-            except Exception:
-                geom_hash = "custom"
-
-        cache_key = f"{start_year}_{end_year}_{start_month}_{end_month}_{geom_hash}"
-        if not hasattr(self, "_temporal_cache"):
-            self._temporal_cache = {}
-        if cache_key in self._temporal_cache:
-            return self._temporal_cache[cache_key]
-
         if not self.is_connected:
             self.initialize_gee()
         if not self.is_connected:
             raise RuntimeError(f"Earth Engine is not connected: {self._last_message}")
 
-        if geometry is None:
-            # Default study area: Pune District pilot area (5km buffer radius)
-            geometry = ee.Geometry.Point([73.8567, 18.5204]).buffer(5000)
+        # Resolve effective geometry, center coordinates, and radius
+        effective_radius = float(radius_km) if radius_km is not None else 5.0
+        if center_lat is not None and center_lng is not None:
+            cent_lat, cent_lng = float(center_lat), float(center_lng)
+            if geometry is None:
+                geometry = ee.Geometry.Point([cent_lng, cent_lat]).buffer(effective_radius * 1000.0)
+        elif geometry is None:
+            # Default study area: Pune District pilot area with requested radius buffer
+            geometry = ee.Geometry.Point([73.8567, 18.5204]).buffer(effective_radius * 1000.0)
+            cent_lng, cent_lat = 73.8567, 18.5204
+        else:
+            try:
+                cent = geometry.centroid(maxError=200).getInfo()["coordinates"]
+                cent_lng, cent_lat = float(cent[0]), float(cent[1])
+            except Exception:
+                cent_lng, cent_lat = 73.8567, 18.5204
+
+            if radius_km is None:
+                # If radius_km not passed, compute approximate equivalent radius from vector area
+                try:
+                    area_m2 = float(geometry.area(maxError=200).getInfo() or 0.0)
+                    effective_radius = round(math.sqrt(max(0.0, area_m2 / 1e6) / math.pi), 2)
+                except Exception:
+                    effective_radius = 5.0
+
+        # Construct comprehensive cache key containing all spatial and temporal parameters
+        cache_key = (
+            f"temporal_v2_{start_year}_{end_year}_M{start_month:02d}M{end_month:02d}_"
+            f"lng{cent_lng:.4f}_lat{cent_lat:.4f}_r{effective_radius:.2f}km"
+        )
+        if not hasattr(self, "_temporal_cache"):
+            self._temporal_cache = {}
+        if cache_key in self._temporal_cache:
+            cached_result = copy.deepcopy(self._temporal_cache[cache_key])
+            if "summary" in cached_result and "metadata" in cached_result["summary"]:
+                cached_result["summary"]["metadata"]["cached"] = True
+                cached_result["summary"]["metadata"]["cache_key"] = cache_key
+            return cached_result
 
         # 1. Produce independent annual composite and compute indices for EACH requested year
         years = sorted(list(range(min(start_year, end_year), max(start_year, end_year) + 1)))
@@ -753,14 +782,23 @@ class GEEService:
         ndwi_change_img = annual_data[eval_yr]["ndwi"].subtract(annual_data[base_yr]["ndwi"]).rename("NDWI_Change")
         ndbi_change_img = annual_data[eval_yr]["ndbi"].subtract(annual_data[base_yr]["ndbi"]).rename("NDBI_Change")
 
-        # Physical surface areas using pixelArea()
+        # Dynamically adapt pixel area reduction scale and provide known geometry area
+        if effective_radius >= 15.0:
+            reduction_scale = 50
+        elif effective_radius >= 8.0:
+            reduction_scale = 35
+        else:
+            reduction_scale = 25
+
+        theoretical_geom_km2 = round(math.pi * (effective_radius ** 2), 2)
         area_metrics = self.calculate_pixel_areas(
             geometry=geometry,
             ndvi_start=annual_data[base_yr]["ndvi"],
             ndvi_change=ndvi_change_img,
             ndbi_change=ndbi_change_img,
             ndwi_change=ndwi_change_img,
-            scale=50,
+            scale=reduction_scale,
+            known_geom_km2=theoretical_geom_km2,
         )
 
         total_geom_area = area_metrics["geometry_area_km2"]
@@ -784,11 +822,12 @@ class GEEService:
             else "Land Disturbance"
         )
 
-        # Month-wise breakdown: query real monthly scenes if available
+        # Month-wise breakdown: batch all monthly index reductions into a single roundtrip
         month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
         monthly_breakdown = []
+        monthly_stack = None
+
         for m in range(start_month, end_month):
-            m_name = month_names[m - 1]
             try:
                 m_start_dt = ee.Date.fromYMD(base_yr, m, 1)
                 m_end_dt = ee.Date.fromYMD(base_yr, m + 1, 1) if m < 12 else ee.Date.fromYMD(base_yr + 1, 1, 1)
@@ -824,46 +863,54 @@ class GEEService:
                     ))
                 )
 
-                base_m_ndvi = self.calculate_ndvi(m_base_col.median().clip(geometry))
-                eval_m_ndvi = self.calculate_ndvi(m_eval_col.median().clip(geometry))
+                base_m_ndvi = ee.Image(ee.Algorithms.If(
+                    m_base_col.size().gt(0),
+                    self.calculate_ndvi(m_base_col.median().clip(geometry)),
+                    ee.Image.constant(0).rename("NDVI").selfMask(),
+                ))
+                eval_m_ndvi = ee.Image(ee.Algorithms.If(
+                    m_eval_col.size().gt(0),
+                    self.calculate_ndvi(m_eval_col.median().clip(geometry)),
+                    ee.Image.constant(0).rename("NDVI").selfMask(),
+                ))
 
-                m_pair = base_m_ndvi.select(["NDVI"], ["m_base"]).addBands(
-                    eval_m_ndvi.select(["NDVI"], ["m_eval"])
+                m_pair = base_m_ndvi.select(["NDVI"], [f"m_base_{m}"]).addBands(
+                    eval_m_ndvi.select(["NDVI"], [f"m_eval_{m}"])
                 )
-                m_stats = m_pair.reduceRegion(
+                monthly_stack = m_pair if monthly_stack is None else monthly_stack.addBands(m_pair)
+            except Exception as ex_bld:
+                logger.debug(f"Failed to build monthly pair for month {m}: {ex_bld}")
+
+        monthly_stats = {}
+        if monthly_stack is not None:
+            try:
+                monthly_stats = monthly_stack.reduceRegion(
                     reducer=ee.Reducer.mean(),
                     geometry=geometry,
                     scale=100,
                     maxPixels=1e8,
                 ).getInfo() or {}
+            except Exception as ex_mred:
+                logger.warning(f"Batch monthly reduceRegion failed: {ex_mred}")
 
-                mb_val = m_stats.get("m_base")
-                me_val = m_stats.get("m_eval")
+        for m in range(start_month, end_month):
+            m_name = month_names[m - 1]
+            mb_val = monthly_stats.get(f"m_base_{m}")
+            me_val = monthly_stats.get(f"m_eval_{m}")
 
-                if mb_val is not None and me_val is not None:
-                    mb_f = round(float(mb_val), 4)
-                    me_f = round(float(me_val), 4)
-                    monthly_breakdown.append({
-                        "month_num": m,
-                        "month_name": m_name,
-                        "start_year_val": mb_f,
-                        "end_year_val": me_f,
-                        "change_val": round(me_f - mb_f, 4),
-                        "indicator_type": "NDVI (Vegetation Index)",
-                        "is_observed": True,
-                    })
-                else:
-                    monthly_breakdown.append({
-                        "month_num": m,
-                        "month_name": m_name,
-                        "start_year_val": None,
-                        "end_year_val": None,
-                        "change_val": None,
-                        "indicator_type": "NDVI (Vegetation Index)",
-                        "is_observed": False,
-                    })
-            except Exception as ex:
-                logger.debug(f"Monthly reduction error for month {m}: {ex}")
+            if mb_val is not None and me_val is not None:
+                mb_f = round(float(mb_val), 4)
+                me_f = round(float(me_val), 4)
+                monthly_breakdown.append({
+                    "month_num": m,
+                    "month_name": m_name,
+                    "start_year_val": mb_f,
+                    "end_year_val": me_f,
+                    "change_val": round(me_f - mb_f, 4),
+                    "indicator_type": "NDVI (Vegetation Index)",
+                    "is_observed": True,
+                })
+            else:
                 monthly_breakdown.append({
                     "month_num": m,
                     "month_name": m_name,
@@ -880,9 +927,15 @@ class GEEService:
                 "end_year": end_year,
                 "start_month": start_month,
                 "end_month": end_month,
-                "region": "Pune Pilot Area, Maharashtra" if geom_hash == "default" else "Custom AOI Zone",
+                "region": (
+                    f"Pune Pilot Area (r={effective_radius}km)"
+                    if round(cent_lat, 4) == 18.5204 and round(cent_lng, 4) == 73.8567
+                    else f"Custom AOI Zone ({cent_lat:.4f}°N, {cent_lng:.4f}°E, r={effective_radius}km)"
+                ),
                 "total_area_km2": total_geom_area,
                 "geometry_area_km2": total_geom_area,
+                "target_coordinates": {"lat": cent_lat, "lng": cent_lng},
+                "radius_km": effective_radius,
                 "raster_pixel_area_km2": area_metrics["raster_pixel_area_km2"],
                 "valid_observed_area_km2": area_metrics["valid_observed_area_km2"],
                 "overlap_loss_disturbance_km2": area_metrics["overlap_loss_disturbance_km2"],
@@ -904,6 +957,11 @@ class GEEService:
                     "seasonal_window": f"{start_month:02d}-01 to {end_month:02d}-01 (exclusive)",
                     "years_analyzed": years,
                     "reduction_scale_meters": 50,
+                    "target_coordinates": {"lat": cent_lat, "lng": cent_lng},
+                    "radius_km": effective_radius,
+                    "geometry_area_km2": total_geom_area,
+                    "cache_key": cache_key,
+                    "cached": False,
                     "area_definitions": {
                         "geometry_area_km2": "Spherical geodesic area of vector polygon boundary",
                         "raster_pixel_area_km2": "Sum of pixelArea() of raster cells within boundary at 50m scale",
@@ -918,7 +976,7 @@ class GEEService:
             "monthly_breakdown": monthly_breakdown,
         }
 
-        self._temporal_cache[cache_key] = result
+        self._temporal_cache[cache_key] = copy.deepcopy(result)
         return result
 
     def analyze_dual_sensor_aoi(
@@ -2012,37 +2070,39 @@ class GEEService:
         start_month: int = DEFAULT_START_MONTH,
         end_month: int = DEFAULT_END_MONTH,
         geometry: Optional[ee.Geometry] = None,
+        radius_km: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Generate Google Earth Engine tile URL templates for Leaflet/MapLibre map display.
         Uses Cloud Score+ pixel-level screening and exact seasonal window.
         """
-        geom_hash = "default"
-        center = [18.5204, 73.8567]
-        zoom = 12
-
-        if geometry is not None:
-            try:
-                cent = geometry.centroid(maxError=200).getInfo()["coordinates"]
-                center = [round(float(cent[1]), 5), round(float(cent[0]), 5)]
-                geom_hash = f"{center[0]:.3f}_{center[1]:.3f}"
-            except Exception:
-                geom_hash = "custom"
-
-        cache_key = f"tiles_{start_year}_{end_year}_{start_month}_{end_month}_{geom_hash}"
-        if not hasattr(self, "_tile_cache"):
-            self._tile_cache = {}
-        if cache_key in self._tile_cache:
-            return self._tile_cache[cache_key]
-
         if not self.is_connected:
             self.initialize_gee()
         if not self.is_connected:
             return {"status": "error", "message": self._last_message, "layers": {}}
 
-        # Default geometry: Pune District AOI buffer (25km radius ~ 1,960 km2)
+        rad_km = float(radius_km) if radius_km is not None else 25.0
+        center = [18.5204, 73.8567]
+        zoom = 12
+
         if geometry is None:
-            geometry = ee.Geometry.Point([73.8567, 18.5204]).buffer(25000)
+            # Default geometry: Pune District AOI buffer with requested radius
+            geometry = ee.Geometry.Point([73.8567, 18.5204]).buffer(rad_km * 1000.0)
+        else:
+            try:
+                cent = geometry.centroid(maxError=200).getInfo()["coordinates"]
+                center = [round(float(cent[1]), 5), round(float(cent[0]), 5)]
+            except Exception:
+                center = [18.5204, 73.8567]
+
+        cache_key = (
+            f"tiles_v2_{start_year}_{end_year}_M{start_month:02d}M{end_month:02d}_"
+            f"lat{center[0]:.4f}_lng{center[1]:.4f}_r{rad_km:.2f}km"
+        )
+        if not hasattr(self, "_tile_cache"):
+            self._tile_cache = {}
+        if cache_key in self._tile_cache:
+            return copy.deepcopy(self._tile_cache[cache_key])
 
         try:
             c_start, _, _ = self.get_annual_composite(start_year, geometry, start_month, end_month)
@@ -2120,7 +2180,7 @@ class GEEService:
                     "scene_cloud_filter_max": CLOUD_FILTER_PERCENT,
                 },
             }
-            self._tile_cache[cache_key] = res
+            self._tile_cache[cache_key] = copy.deepcopy(res)
             return res
         except Exception as exc:
             logger.warning(f"Error generating map tiles for {start_year}-{end_year}: {exc}")
